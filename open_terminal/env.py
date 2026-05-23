@@ -170,4 +170,27 @@ SESSION_CWD_TTL: float = float(
     )
 )
 
+GITHUB_SYNC_ENABLED = os.environ.get(
+    "OPEN_TERMINAL_GITHUB_SYNC_ENABLED",
+    str(config.get("github_sync_enabled", False)),
+).lower() not in ("false", "0", "no", "")
+
+GITHUB_SYNC_INTERVAL = int(os.environ.get(
+    "OPEN_TERMINAL_GITHUB_SYNC_INTERVAL",
+    config.get("github_sync_interval", 60),
+))
+
+GITHUB_SYNC_EXCLUDE_PATTERNS = os.environ.get(
+    "OPEN_TERMINAL_GITHUB_SYNC_EXCLUDE",
+    config.get("github_sync_exclude", "node_modules,.git,__pycache__,*.pyc"),
+)
+
+GITHUB_REPO = _resolve_file_env("OPEN_TERMINAL_GITHUB_REPO", config.get("github_repo", ""))
+GITHUB_TOKEN = _resolve_file_env("OPEN_TERMINAL_GITHUB_TOKEN", config.get("github_token", ""))
+
+GITHUB_SYNC_CWD = os.environ.get(
+    "OPEN_TERMINAL_GITHUB_SYNC_CWD",
+    config.get("github_sync_cwd", "."),
+)
+
 

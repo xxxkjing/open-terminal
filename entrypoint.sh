@@ -162,4 +162,10 @@ if [ "${OPEN_TERMINAL_ALLOWED_DOMAINS+set}" = "set" ]; then
     exec capsh --drop=cap_net_admin -- -c "exec open-terminal $*"
 fi
 
+# Initialize GitHub Sync if enabled
+if [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-false}" = "true" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-false}" = "1" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-}" = "yes" ]; then
+    echo "Initializing GitHub sync..."
+    python3 -c "import asyncio; from open_terminal.sync import git_sync; asyncio.run(git_sync.init_repo())"
+fi
+
 exec open-terminal "$@"
