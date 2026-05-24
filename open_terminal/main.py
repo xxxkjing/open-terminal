@@ -1784,3 +1784,50 @@ if ENABLE_NOTEBOOKS:
 
     app.include_router(create_notebooks_router(verify_api_key))
 
+
+# ---------------------------------------------------------------------------
+# GitHub Auto-Sync (optional)
+# ---------------------------------------------------------------------------
+from open_terminal.sync import git_sync
+from open_terminal.utils.sync_daemon import start_daemon, stop_daemon
+
+@app.on_event("startup")
+async def startup_event():
+    start_daemon()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    stop_daemon()
+
+@app.get(
+    "/api/sync/status",
+    operation_id="get_sync_status",
+    summary="Get GitHub sync status",
+    dependencies=[Depends(verify_api_key)]
+)
+async def get_sync_status():
+    return git_sync.get_status()
+
+@app.post(
+    "/api/sync/trigger",
+    operation_id="trigger_sync",
+    summary="Manually trigger GitHub sync",
+    dependencies=[Depends(verify_api_key)]
+)
+async def trigger_sync():
+    return await git_sync.sync()
+
+@app.post(
+    "/api/sync/enable",
+    operation_id="enable_sync",
+    summary="Enable or disable GitHub auto-sync",
+    dependencies=[Depends(verify_api_key)]
+)
+async def enable_sync(enabled: bool = Query(..., description="Enable or disable sync")):
+    git_sync.enabled = enabled
+    if enabled:
+        start_daemon()
+    else:
+        stop_daemon()
+    return {"enabled": git_sync.enabled}
+
