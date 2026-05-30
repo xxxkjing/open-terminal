@@ -28,6 +28,21 @@ def _resolve_file_env(var: str, default: str = "") -> str:
     return value if value is not None else default
 
 
+def _resolve_file_env_alias(var: str, alias: str, default: str = "") -> str:
+    """Resolve the preferred env var, falling back to a legacy alias."""
+    value = _resolve_file_env(var, None)
+    if value is not None:
+        return value
+    return _resolve_file_env(alias, default)
+
+
+def _get_env_alias(var: str, alias: str, default: str = "") -> str:
+    value = os.environ.get(var)
+    if value is not None:
+        return value
+    return os.environ.get(alias, default)
+
+
 API_KEY = _resolve_file_env("OPEN_TERMINAL_API_KEY", config.get("api_key", ""))
 CORS_ALLOWED_ORIGINS = os.environ.get(
     "OPEN_TERMINAL_CORS_ALLOWED_ORIGINS",
@@ -170,26 +185,38 @@ SESSION_CWD_TTL: float = float(
     )
 )
 
-GITHUB_SYNC_ENABLED = os.environ.get(
+GITHUB_SYNC_ENABLED = _get_env_alias(
     "OPEN_TERMINAL_GITHUB_SYNC_ENABLED",
+    "GITHUB_SYNC_ENABLED",
     str(config.get("github_sync_enabled", False)),
 ).lower() not in ("false", "0", "no", "")
 
-GITHUB_SYNC_INTERVAL = int(os.environ.get(
+GITHUB_SYNC_INTERVAL = int(_get_env_alias(
     "OPEN_TERMINAL_GITHUB_SYNC_INTERVAL",
+    "GITHUB_SYNC_INTERVAL",
     config.get("github_sync_interval", 60),
 ))
 
-GITHUB_SYNC_EXCLUDE_PATTERNS = os.environ.get(
+GITHUB_SYNC_EXCLUDE_PATTERNS = _get_env_alias(
     "OPEN_TERMINAL_GITHUB_SYNC_EXCLUDE",
+    "GITHUB_SYNC_EXCLUDE",
     config.get("github_sync_exclude", "node_modules,.git,__pycache__,*.pyc"),
 )
 
-GITHUB_REPO = _resolve_file_env("OPEN_TERMINAL_GITHUB_REPO", config.get("github_repo", ""))
-GITHUB_TOKEN = _resolve_file_env("OPEN_TERMINAL_GITHUB_TOKEN", config.get("github_token", ""))
+GITHUB_REPO = _resolve_file_env_alias(
+    "OPEN_TERMINAL_GITHUB_REPO",
+    "GITHUB_REPO",
+    config.get("github_repo", ""),
+)
+GITHUB_TOKEN = _resolve_file_env_alias(
+    "OPEN_TERMINAL_GITHUB_TOKEN",
+    "GITHUB_TOKEN",
+    config.get("github_token", ""),
+)
 
-GITHUB_SYNC_CWD = os.environ.get(
+GITHUB_SYNC_CWD = _get_env_alias(
     "OPEN_TERMINAL_GITHUB_SYNC_CWD",
+    "GITHUB_SYNC_CWD",
     config.get("github_sync_cwd", "."),
 )
 

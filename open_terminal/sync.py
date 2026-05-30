@@ -49,7 +49,9 @@ class GitSync:
         if not repo:
             return ""
 
-        if not repo.startswith(("http://", "https://", "git@", "file://")) and not os.path.isabs(repo):
+        if repo.startswith("github.com/"):
+            base_url = f"https://{repo}"
+        elif not repo.startswith(("http://", "https://", "git@", "file://")) and not os.path.isabs(repo):
             repo = repo.removesuffix(".git")
             base_url = f"https://github.com/{repo}.git"
         else:
