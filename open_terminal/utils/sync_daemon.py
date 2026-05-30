@@ -1,11 +1,12 @@
+import asyncio
+import logging
 import threading
 import time
-import logging
-import asyncio
+
 from open_terminal.sync import git_sync
-from open_terminal.env import GITHUB_SYNC_ENABLED
 
 logger = logging.getLogger(__name__)
+
 
 class SyncDaemon(threading.Thread):
     def __init__(self):
@@ -18,35 +19,47 @@ class SyncDaemon(threading.Thread):
         try:
             self.loop.run_until_complete(git_sync.init_repo())
         except Exception as e:
-            logger.error(f"Error initializing git sync repo: {e}")
-            
+            logger.error("Error initializing git sync repo: %s", e)
+
         while not self.stop_event.is_set():
             if git_sync.enabled:
                 try:
                     self.loop.run_until_complete(git_sync.sync())
                 except Exception as e:
-                    logger.error(f"Error during git sync: {e}")
-            
-            # Wait for interval or stop_event
-            # Sleep in small chunks to be responsive to stop_event
-            interval = git_sync.interval
+                    logger.error("Error during git sync: %s", e)
+
+            interval = max(1, int(git_sync.interval or 1))
             waited = 0
             while waited < interval and not self.stop_event.is_set():
                 time.sleep(1)
                 waited += 1
-                
+
         self.loop.close()
 
     def stop(self):
         self.stop_event.set()
 
-sync_daemon = SyncDaemon()
+
+_sync_daemon = None
+_sync_lock = threading.Lock()
+
 
 def start_daemon():
-    if GITHUB_SYNC_ENABLED and not sync_daemon.is_alive():
-        sync_daemon.start()
+    global _sync_daemon
+    if not git_sync.enabled or not git_sync.repo:
+        return
+
+    with _sync_lock:
+        if _sync_daemon is None or not _sync_daemon.is_alive():
+            _sync_daemon = SyncDaemon()
+            _sync_daemon.start()
+
 
 def stop_daemon():
-    if sync_daemon.is_alive():
-        sync_daemon.stop()
-        sync_daemon.join(timeout=5)
+    global _sync_daemon
+    with _sync_lock:
+        daemon = _sync_daemon
+        if daemon and daemon.is_alive():
+            daemon.stop()
+            daemon.join(timeout=5)
+        _sync_daemon = None
