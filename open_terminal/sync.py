@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import time
 from typing import Optional, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -13,9 +14,32 @@ from open_terminal.env import (
     GITHUB_SYNC_EXCLUDE_PATTERNS,
     GITHUB_SYNC_INTERVAL,
     GITHUB_TOKEN,
+    LOG_DIR,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def setup_sync_logging() -> str:
+    """Ensure GitHub sync messages are always written to a log file."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, "sync.log")
+
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and handler.baseFilename == log_path:
+            return log_path
+
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = True
+    return log_path
+
+
+SYNC_LOG_PATH = setup_sync_logging()
 
 
 class GitSync:
@@ -31,6 +55,7 @@ class GitSync:
         self._sync_task = None
         self._last_sync_time = None
         self._last_sync_status = "Not started"
+        self._last_sync_log = SYNC_LOG_PATH
         self._lock = asyncio.Lock()
 
         self.remote_url = self._build_remote_url(self.repo, self.token)
@@ -70,6 +95,8 @@ class GitSync:
         return urlunparse(parsed._replace(scheme="https", netloc=netloc))
 
     async def run_cmd(self, *args: str, check: bool = False) -> Tuple[int, str, str]:
+        display_cmd = " ".join(shlex.quote(arg) for arg in args)
+        logger.info("Running command in %s: %s", self.cwd, self._sanitize(display_cmd))
         process = await asyncio.create_subprocess_exec(
             *args,
             cwd=self.cwd,
@@ -79,8 +106,14 @@ class GitSync:
         stdout, stderr = await process.communicate()
         out = self._sanitize(stdout.decode(errors="replace"))
         err = self._sanitize(stderr.decode(errors="replace"))
+        if out.strip():
+            logger.info("Command stdout: %s", out.strip())
+        if err.strip():
+            log = logger.error if process.returncode else logger.info
+            log("Command stderr: %s", err.strip())
+        logger.info("Command finished with code %s: %s", process.returncode, self._sanitize(display_cmd))
         if check and process.returncode != 0:
-            raise RuntimeError(f"Command failed ({' '.join(args)}): {err or out}")
+            raise RuntimeError(f"Command failed ({display_cmd}): {err or out}")
         return process.returncode, out, err
 
     async def _git(self, *args: str, check: bool = False) -> Tuple[int, str, str]:
@@ -129,9 +162,11 @@ class GitSync:
 
     async def init_repo(self):
         if not self.enabled or not self.repo:
+            logger.info("GitHub sync initialization skipped: enabled=%s repo_configured=%s", self.enabled, bool(self.repo))
             return
 
         async with self._lock:
+            logger.info("Initializing GitHub sync: cwd=%s repo=%s branch=%s log=%s", self.cwd, self.repo, self.branch, self._last_sync_log)
             os.makedirs(self.cwd, exist_ok=True)
 
             if not await self._is_git_repo():
@@ -161,14 +196,21 @@ class GitSync:
                     await self._git("checkout", "-B", self.branch)
 
                 if await self._remote_branch_exists(self.branch):
+                    logger.info("Restoring data from origin/%s on startup", self.branch)
                     await self._git("branch", "--set-upstream-to", f"origin/{self.branch}", self.branch)
-                    await self._git("pull", "--rebase", "--autostash", "origin", self.branch)
+                    await self._git("pull", "--rebase", "--autostash", "origin", self.branch, check=True)
+                    self._last_sync_status = "Startup restore completed"
+                    self._last_sync_time = time.time()
+                else:
+                    logger.info("Remote branch origin/%s does not exist yet; startup restore skipped", self.branch)
 
     async def sync(self) -> dict:
         if not self.enabled or not self.repo:
-            return {"status": "disabled"}
+            logger.info("GitHub sync skipped: enabled=%s repo_configured=%s", self.enabled, bool(self.repo))
+            return {"status": "disabled", "log": self._last_sync_log}
 
         async with self._lock:
+            logger.info("Starting GitHub sync: cwd=%s repo=%s branch=%s", self.cwd, self.repo, self.branch)
             try:
                 # init_repo also uses the same lock, so do the setup inline here.
                 os.makedirs(self.cwd, exist_ok=True)
@@ -205,50 +247,64 @@ class GitSync:
                     )
                     if code != 0:
                         self._last_sync_status = f"Pull failed: {stderr or stdout}"
-                        return {"status": "error", "error": self._last_sync_status}
+                        logger.error(self._last_sync_status)
+                        return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
+                else:
+                    logger.info("Remote branch origin/%s does not exist yet; sync will create it on push", self.branch)
 
                 await self._git("add", "-A", check=True)
 
                 code, stdout, _ = await self._git("status", "--porcelain")
                 if code != 0:
                     self._last_sync_status = "Status check failed"
-                    return {"status": "error", "error": self._last_sync_status}
+                    logger.error(self._last_sync_status)
+                    return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
 
                 if stdout.strip():
                     commit_msg = f"Auto-sync update {time.strftime('%Y-%m-%d %H:%M:%S')}"
                     code, stdout, stderr = await self._git("commit", "-m", commit_msg)
                     if code != 0:
                         self._last_sync_status = f"Commit failed: {stderr or stdout}"
-                        return {"status": "error", "error": self._last_sync_status}
+                        logger.error(self._last_sync_status)
+                        return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
 
                 code, stdout, stderr = await self._git("push", "-u", "origin", f"HEAD:{self.branch}")
                 if code != 0:
                     self._last_sync_status = f"Push failed: {stderr or stdout}"
-                    return {"status": "error", "error": self._last_sync_status}
+                    logger.error(self._last_sync_status)
+                    return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
 
                 self._last_sync_status = "Success" if stdout.strip() else "Success (No changes)"
                 self._last_sync_time = time.time()
-                return {"status": "success", "message": "Synced successfully", "branch": self.branch}
+                logger.info("GitHub sync completed successfully on branch %s: %s", self.branch, self._last_sync_status)
+                return {"status": "success", "message": "Synced successfully", "branch": self.branch, "log": self._last_sync_log}
 
             except Exception as e:
                 error = self._sanitize(str(e))
                 self._last_sync_status = f"Error: {error}"
-                logger.error("Sync error: %s", error)
-                return {"status": "error", "error": error}
+                logger.exception("Sync error: %s", error)
+                return {"status": "error", "error": error, "log": self._last_sync_log}
 
     async def _sync_loop(self):
+        logger.info("GitHub sync loop starting; interval=%s seconds", self.interval)
         await self.init_repo()
+        await self.sync()
         while self.enabled:
             await asyncio.sleep(self.interval)
             await self.sync()
+        logger.info("GitHub sync loop stopped")
 
     def start(self):
         if self.enabled and self.repo:
             if self._sync_task is None or self._sync_task.done():
+                logger.info("Starting GitHub sync task")
                 self._sync_task = asyncio.create_task(self._sync_loop())
+        else:
+            logger.info("GitHub sync task not started: enabled=%s repo_configured=%s", self.enabled, bool(self.repo))
 
     def stop(self):
         if self._sync_task and not self._sync_task.done():
+            logger.info("Stopping GitHub sync task")
             self._sync_task.cancel()
             self._sync_task = None
 
@@ -260,6 +316,7 @@ class GitSync:
             "interval": self.interval,
             "last_sync_time": self._last_sync_time,
             "last_sync_status": self._last_sync_status,
+            "log": self._last_sync_log,
         }
 
 
