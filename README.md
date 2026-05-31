@@ -144,6 +144,46 @@ You can also point to a specific config file:
 open-terminal run --config /path/to/my-config.toml
 ```
 
+
+### GitHub Startup Sync
+
+Open Terminal can restore and back up its working directory through GitHub on every restart. Enable it with:
+
+```bash
+docker run -d --name open-terminal --restart unless-stopped -p 8000:8000 \
+  -v open-terminal:/home/user \
+  -e OPEN_TERMINAL_API_KEY=your-secret-key \
+  -e OPEN_TERMINAL_GITHUB_SYNC_ENABLED=true \
+  -e OPEN_TERMINAL_GITHUB_REPO=owner/backup-repo \
+  -e OPEN_TERMINAL_GITHUB_TOKEN=github-token \
+  ghcr.io/open-webui/open-terminal
+```
+
+What it does:
+
+- Restores from GitHub during application startup, so a container restart pulls the latest data before regular sync runs.
+- Runs periodic sync in the background. Default interval is `60` seconds.
+- Writes detailed logs to `${OPEN_TERMINAL_LOG_DIR}/sync.log`.
+- Uses `pull --rebase --autostash` and retry logic to reduce conflicts during concurrent updates.
+- Masks GitHub tokens in logs.
+- Supports Docker secrets through `OPEN_TERMINAL_GITHUB_TOKEN_FILE`.
+- Supports legacy aliases `G_NAME` and `G_TOKEN` for compatibility with older backup scripts.
+
+Useful options:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `OPEN_TERMINAL_GITHUB_SYNC_ENABLED` | `false` | Enable startup restore and periodic GitHub sync |
+| `OPEN_TERMINAL_GITHUB_REPO` | empty | GitHub repo, for example `owner/repo` or a full URL |
+| `OPEN_TERMINAL_GITHUB_TOKEN` | empty | Token used for private repo push/pull |
+| `OPEN_TERMINAL_GITHUB_BRANCH` | remote default / `main` | Branch to sync |
+| `OPEN_TERMINAL_GITHUB_SYNC_CWD` | `.` | Directory to sync |
+| `OPEN_TERMINAL_GITHUB_SYNC_INTERVAL` | `60` | Periodic sync interval in seconds |
+| `OPEN_TERMINAL_GITHUB_SYNC_EXCLUDE` | `node_modules,.git,__pycache__,*.pyc` | Comma-separated ignore patterns appended to `.gitignore` |
+| `OPEN_TERMINAL_GITHUB_SYNC_RETRIES` | `3` | Pull/push retry count |
+| `OPEN_TERMINAL_GITHUB_SYNC_RETRY_DELAY` | `5` | Base retry delay in seconds |
+
+
 ## Using with Open WebUI
 
 Open Terminal integrates with [Open WebUI](https://github.com/open-webui/open-webui), giving your AI assistants the ability to run commands, manage files, and interact with a terminal right from the AI interface. Make sure to add it under **Open Terminal** in the integrations settings, not as a tool server. Adding it as an Open Terminal connection gives you a built-in file navigation sidebar where you can browse directories, upload, download, and edit files. There are two ways to connect:

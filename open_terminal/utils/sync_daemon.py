@@ -29,11 +29,13 @@ class SyncDaemon(threading.Thread):
             if git_sync.enabled:
                 try:
                     logger.info("Running scheduled GitHub sync")
-                    self.loop.run_until_complete(git_sync.sync())
+                    result = self.loop.run_until_complete(git_sync.sync())
+                    logger.info("Scheduled GitHub sync result: %s", result)
                 except Exception as e:
                     logger.exception("Error during git sync: %s", e)
 
             interval = max(1, int(git_sync.interval or 1))
+            logger.info("Next GitHub sync in %s seconds", interval)
             waited = 0
             while waited < interval and not self.stop_event.is_set():
                 time.sleep(1)

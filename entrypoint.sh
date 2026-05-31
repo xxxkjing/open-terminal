@@ -24,6 +24,16 @@ file_env() {
 }
 
 file_env 'OPEN_TERMINAL_API_KEY'
+file_env 'OPEN_TERMINAL_GITHUB_TOKEN'
+file_env 'GITHUB_TOKEN'
+
+# Backwards-compatible aliases used by some backup/sync examples.
+if [ -z "${OPEN_TERMINAL_GITHUB_REPO:-}" ] && [ -n "${G_NAME:-}" ]; then
+    export OPEN_TERMINAL_GITHUB_REPO="$G_NAME"
+fi
+if [ -z "${OPEN_TERMINAL_GITHUB_TOKEN:-}" ] && [ -n "${G_TOKEN:-}" ]; then
+    export OPEN_TERMINAL_GITHUB_TOKEN="$G_TOKEN"
+fi
 
 # Fix permissions of the home directory if the user doesn't own it
 # Find out who owns /home/user
@@ -162,10 +172,10 @@ if [ "${OPEN_TERMINAL_ALLOWED_DOMAINS+set}" = "set" ]; then
     exec capsh --drop=cap_net_admin -- -c "exec open-terminal $*"
 fi
 
-# Initialize GitHub Sync if enabled
-if [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-false}" = "true" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-false}" = "1" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-}" = "yes" ]; then
-    echo "Initializing GitHub sync..."
-    python3 -c "import asyncio; from open_terminal.sync import git_sync; asyncio.run(git_sync.init_repo())"
+# GitHub sync is started by the Open Terminal app startup hook.
+# Keep this message in container logs so users can tell where detailed sync logs live.
+if [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-${GITHUB_SYNC_ENABLED:-false}}" = "true" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-${GITHUB_SYNC_ENABLED:-false}}" = "1" ] || [ "${OPEN_TERMINAL_GITHUB_SYNC_ENABLED:-${GITHUB_SYNC_ENABLED:-}}" = "yes" ]; then
+    echo "GitHub sync enabled. Startup restore and periodic sync logs: ${OPEN_TERMINAL_LOG_DIR:-$HOME/.local/state/open-terminal/logs}/sync.log"
 fi
 
 exec open-terminal "$@"

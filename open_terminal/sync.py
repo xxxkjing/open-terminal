@@ -49,11 +49,16 @@ class GitSync:
         self.token = GITHUB_TOKEN
         self.interval = GITHUB_SYNC_INTERVAL
         self.exclude = GITHUB_SYNC_EXCLUDE_PATTERNS
-        self.cwd = os.path.abspath(GITHUB_SYNC_CWD)
+        self.cwd = os.path.abspath(os.path.expanduser(GITHUB_SYNC_CWD))
         self.branch = os.environ.get("OPEN_TERMINAL_GITHUB_BRANCH", "main")
+        self.remote_name = "origin"
+        self.backup_dir = os.environ.get("OPEN_TERMINAL_GITHUB_BACKUP_DIR", ".open-terminal-backups")
+        self.max_retries = int(os.environ.get("OPEN_TERMINAL_GITHUB_SYNC_RETRIES", "3"))
+        self.retry_delay = int(os.environ.get("OPEN_TERMINAL_GITHUB_SYNC_RETRY_DELAY", "5"))
 
         self._sync_task = None
         self._last_sync_time = None
+        self._last_restore_time = None
         self._last_sync_status = "Not started"
         self._last_sync_log = SYNC_LOG_PATH
         self._lock = asyncio.Lock()
@@ -113,7 +118,7 @@ class GitSync:
             log("Command stderr: %s", err.strip())
         logger.info("Command finished with code %s: %s", process.returncode, self._sanitize(display_cmd))
         if check and process.returncode != 0:
-            raise RuntimeError(f"Command failed ({display_cmd}): {err or out}")
+            raise RuntimeError(f"Command failed ({self._sanitize(display_cmd)}): {err or out}")
         return process.returncode, out, err
 
     async def _git(self, *args: str, check: bool = False) -> Tuple[int, str, str]:
@@ -124,11 +129,13 @@ class GitSync:
         return code == 0 and stdout.strip() == "true"
 
     async def _remote_branch_exists(self, branch: str) -> bool:
-        code, _, _ = await self._git("ls-remote", "--exit-code", "--heads", "origin", branch)
+        if not self.remote_url:
+            return False
+        code, _, _ = await self._git("ls-remote", "--exit-code", "--heads", self.remote_name, branch)
         return code == 0
 
     async def _detect_remote_default_branch(self) -> Optional[str]:
-        code, stdout, _ = await self._git("remote", "show", "origin")
+        code, stdout, _ = await self._git("remote", "show", self.remote_name)
         if code != 0:
             return None
         for line in stdout.splitlines():
@@ -140,10 +147,19 @@ class GitSync:
         return None
 
     async def _ensure_gitignore(self) -> None:
-        if not self.exclude:
-            return
-        excludes = [e.strip() for e in self.exclude.split(",") if e.strip()]
-        if not excludes:
+        patterns = [e.strip() for e in (self.exclude or "").split(",") if e.strip()]
+        defaults = [
+            ".git/",
+            ".open-terminal-sync.lock",
+            "*.tmp",
+            "*.swp",
+            ".DS_Store",
+            "Thumbs.db",
+        ]
+        for pattern in defaults:
+            if pattern not in patterns:
+                patterns.append(pattern)
+        if not patterns:
             return
 
         gitignore_path = os.path.join(self.cwd, ".gitignore")
@@ -153,12 +169,120 @@ class GitSync:
                 existing = f.read()
 
         existing_lines = {line.strip() for line in existing.splitlines()}
-        missing = [pattern for pattern in excludes if pattern not in existing_lines]
+        missing = [pattern for pattern in patterns if pattern not in existing_lines]
         if missing:
             with open(gitignore_path, "a", encoding="utf-8") as f:
                 if existing and not existing.endswith("\n"):
                     f.write("\n")
+                f.write("\n# Open Terminal GitHub sync excludes\n")
                 f.write("\n".join(missing) + "\n")
+            logger.info("Updated .gitignore with sync exclude patterns: %s", missing)
+
+    async def _ensure_repo(self) -> None:
+        os.makedirs(self.cwd, exist_ok=True)
+
+        if not await self._is_git_repo():
+            logger.info("Initializing git repository for sync")
+            await self._git("init", check=True)
+
+        await self._git("config", "user.name", "Auto Sync")
+        await self._git("config", "user.email", "auto-sync@open-terminal.local")
+        await self._git("config", "pull.rebase", "true")
+        await self._git("config", "rebase.autoStash", "true")
+        await self._ensure_gitignore()
+
+        if self.remote_url:
+            code, _, _ = await self._git("remote", "get-url", self.remote_name)
+            if code == 0:
+                await self._git("remote", "set-url", self.remote_name, self.remote_url, check=True)
+            else:
+                await self._git("remote", "add", self.remote_name, self.remote_url, check=True)
+
+    async def _checkout_branch(self) -> None:
+        if self.remote_url:
+            await self._git("fetch", self.remote_name, "--prune")
+            remote_default = await self._detect_remote_default_branch()
+            if remote_default and "OPEN_TERMINAL_GITHUB_BRANCH" not in os.environ:
+                self.branch = remote_default
+
+        local_branch_code, _, _ = await self._git("rev-parse", "--verify", self.branch)
+        if local_branch_code == 0:
+            await self._git("checkout", self.branch, check=True)
+        elif await self._remote_branch_exists(self.branch):
+            await self._git("checkout", "-B", self.branch, f"{self.remote_name}/{self.branch}", check=True)
+        else:
+            await self._git("checkout", "-B", self.branch, check=True)
+
+        if await self._remote_branch_exists(self.branch):
+            await self._git("branch", "--set-upstream-to", f"{self.remote_name}/{self.branch}", self.branch)
+
+    async def _has_commits(self) -> bool:
+        code, _, _ = await self._git("rev-parse", "--verify", "HEAD")
+        return code == 0
+
+    async def _dirty_status(self) -> str:
+        code, stdout, _ = await self._git("status", "--porcelain")
+        if code != 0:
+            return ""
+        return stdout.strip()
+
+    async def _create_startup_backup(self) -> Optional[str]:
+        dirty = await self._dirty_status()
+        if not dirty:
+            logger.info("Startup backup skipped: no local changes")
+            return None
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        branch = f"{self.backup_dir}/startup-{timestamp}"
+        if await self._has_commits():
+            code, _, _ = await self._git("stash", "push", "--include-untracked", "-m", f"open-terminal startup backup {timestamp}")
+            if code == 0:
+                logger.info("Local changes stashed before startup restore: %s", timestamp)
+                return "stash@{0}"
+
+        await self._git("add", "-A", check=True)
+        code, stdout, stderr = await self._git("commit", "-m", f"Startup backup before restore {timestamp}")
+        if code == 0:
+            await self._git("branch", branch)
+            logger.info("Created startup backup commit and branch: %s", branch)
+            return branch
+
+        logger.warning("Startup backup commit failed; continuing carefully: %s", stderr or stdout)
+        return None
+
+    async def _restore_startup_backup(self, backup_ref: Optional[str]) -> None:
+        if not backup_ref or not backup_ref.startswith("stash@"):
+            return
+
+        logger.info("Re-applying startup backup after restore: %s", backup_ref)
+        code, stdout, stderr = await self._git("stash", "apply", "--index", backup_ref)
+        if code == 0:
+            await self._git("stash", "drop", backup_ref)
+            logger.info("Startup backup re-applied successfully")
+        else:
+            logger.error("Startup backup re-apply failed; stash kept for manual recovery: %s", stderr or stdout)
+
+    async def _pull_with_retry(self) -> Tuple[int, str, str]:
+        last = (1, "", "pull not attempted")
+        for attempt in range(1, self.max_retries + 1):
+            logger.info("Pull attempt %s/%s from %s/%s", attempt, self.max_retries, self.remote_name, self.branch)
+            last = await self._git("pull", "--rebase", "--autostash", self.remote_name, self.branch)
+            if last[0] == 0:
+                return last
+            if attempt < self.max_retries:
+                await asyncio.sleep(self.retry_delay * attempt)
+        return last
+
+    async def _push_with_retry(self) -> Tuple[int, str, str]:
+        last = (1, "", "push not attempted")
+        for attempt in range(1, self.max_retries + 1):
+            logger.info("Push attempt %s/%s to %s/%s", attempt, self.max_retries, self.remote_name, self.branch)
+            last = await self._git("push", "-u", self.remote_name, f"HEAD:{self.branch}")
+            if last[0] == 0:
+                return last
+            if attempt < self.max_retries:
+                await asyncio.sleep(self.retry_delay * attempt)
+        return last
 
     async def init_repo(self):
         if not self.enabled or not self.repo:
@@ -166,43 +290,75 @@ class GitSync:
             return
 
         async with self._lock:
-            logger.info("Initializing GitHub sync: cwd=%s repo=%s branch=%s log=%s", self.cwd, self.repo, self.branch, self._last_sync_log)
-            os.makedirs(self.cwd, exist_ok=True)
-
-            if not await self._is_git_repo():
-                logger.info("Initializing git repository for sync...")
-                await self._git("init", check=True)
-
-            await self._git("config", "user.name", "Auto Sync")
-            await self._git("config", "user.email", "auto-sync@open-terminal.local")
-            await self._ensure_gitignore()
-
-            if self.remote_url:
-                code, _, _ = await self._git("remote", "get-url", "origin")
-                if code == 0:
-                    await self._git("remote", "set-url", "origin", self.remote_url, check=True)
-                else:
-                    await self._git("remote", "add", "origin", self.remote_url, check=True)
-
-                await self._git("fetch", "origin", "--prune")
-                remote_default = await self._detect_remote_default_branch()
-                if remote_default:
-                    self.branch = os.environ.get("OPEN_TERMINAL_GITHUB_BRANCH", remote_default)
-
-                local_branch_code, _, _ = await self._git("rev-parse", "--verify", self.branch)
-                if local_branch_code == 0:
-                    await self._git("checkout", self.branch)
-                else:
-                    await self._git("checkout", "-B", self.branch)
+            logger.info("Initializing GitHub sync with startup restore: cwd=%s repo=%s branch=%s log=%s", self.cwd, self.repo, self.branch, self._last_sync_log)
+            try:
+                await self._ensure_repo()
+                await self._checkout_branch()
 
                 if await self._remote_branch_exists(self.branch):
-                    logger.info("Restoring data from origin/%s on startup", self.branch)
-                    await self._git("branch", "--set-upstream-to", f"origin/{self.branch}", self.branch)
-                    await self._git("pull", "--rebase", "--autostash", "origin", self.branch, check=True)
+                    backup_ref = await self._create_startup_backup()
+                    logger.info("Restoring data from %s/%s on startup", self.remote_name, self.branch)
+                    code, stdout, stderr = await self._pull_with_retry()
+                    if code != 0:
+                        self._last_sync_status = f"Startup restore failed: {stderr or stdout}"
+                        logger.error(self._last_sync_status)
+                        return
+                    await self._restore_startup_backup(backup_ref)
                     self._last_sync_status = "Startup restore completed"
-                    self._last_sync_time = time.time()
+                    self._last_restore_time = time.time()
+                    self._last_sync_time = self._last_restore_time
+                    logger.info("Startup restore completed successfully")
                 else:
-                    logger.info("Remote branch origin/%s does not exist yet; startup restore skipped", self.branch)
+                    logger.info("Remote branch %s/%s does not exist yet; startup restore skipped", self.remote_name, self.branch)
+                    await self.sync_locked(skip_pull=True)
+            except Exception as e:
+                error = self._sanitize(str(e))
+                self._last_sync_status = f"Startup restore error: {error}"
+                logger.exception("GitHub sync initialization error: %s", error)
+
+    async def sync_locked(self, skip_pull: bool = False) -> dict:
+        await self._ensure_repo()
+        await self._checkout_branch()
+
+        if not skip_pull and await self._remote_branch_exists(self.branch):
+            code, stdout, stderr = await self._pull_with_retry()
+            if code != 0:
+                self._last_sync_status = f"Pull failed: {stderr or stdout}"
+                logger.error(self._last_sync_status)
+                return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
+        elif not await self._remote_branch_exists(self.branch):
+            logger.info("Remote branch %s/%s does not exist yet; sync will create it on push", self.remote_name, self.branch)
+
+        await self._git("add", "-A", check=True)
+
+        code, stdout, _ = await self._git("status", "--porcelain")
+        if code != 0:
+            self._last_sync_status = "Status check failed"
+            logger.error(self._last_sync_status)
+            return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
+
+        had_changes = bool(stdout.strip())
+        if had_changes:
+            logger.info("Detected local changes for sync:\n%s", stdout.strip())
+            commit_msg = f"Auto-sync update {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            code, stdout, stderr = await self._git("commit", "-m", commit_msg)
+            if code != 0:
+                self._last_sync_status = f"Commit failed: {stderr or stdout}"
+                logger.error(self._last_sync_status)
+                return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
+        else:
+            logger.info("No file changes detected; push check will still verify upstream")
+
+        code, stdout, stderr = await self._push_with_retry()
+        if code != 0:
+            self._last_sync_status = f"Push failed: {stderr or stdout}"
+            logger.error(self._last_sync_status)
+            return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
+
+        self._last_sync_status = "Success" if had_changes else "Success (No changes)"
+        self._last_sync_time = time.time()
+        logger.info("GitHub sync completed successfully on branch %s: %s", self.branch, self._last_sync_status)
+        return {"status": "success", "message": "Synced successfully", "branch": self.branch, "log": self._last_sync_log}
 
     async def sync(self) -> dict:
         if not self.enabled or not self.repo:
@@ -212,73 +368,7 @@ class GitSync:
         async with self._lock:
             logger.info("Starting GitHub sync: cwd=%s repo=%s branch=%s", self.cwd, self.repo, self.branch)
             try:
-                # init_repo also uses the same lock, so do the setup inline here.
-                os.makedirs(self.cwd, exist_ok=True)
-                if not await self._is_git_repo():
-                    await self._git("init", check=True)
-                await self._git("config", "user.name", "Auto Sync")
-                await self._git("config", "user.email", "auto-sync@open-terminal.local")
-                await self._ensure_gitignore()
-                if self.remote_url:
-                    code, _, _ = await self._git("remote", "get-url", "origin")
-                    if code == 0:
-                        await self._git("remote", "set-url", "origin", self.remote_url, check=True)
-                    else:
-                        await self._git("remote", "add", "origin", self.remote_url, check=True)
-
-                local_branch_code, _, _ = await self._git("rev-parse", "--verify", self.branch)
-                if local_branch_code == 0:
-                    await self._git("checkout", self.branch)
-                else:
-                    await self._git("checkout", "-B", self.branch)
-                await self._git("fetch", "origin", "--prune")
-                remote_default = await self._detect_remote_default_branch()
-                if remote_default and "OPEN_TERMINAL_GITHUB_BRANCH" not in os.environ:
-                    self.branch = remote_default
-                    local_branch_code, _, _ = await self._git("rev-parse", "--verify", self.branch)
-                    if local_branch_code == 0:
-                        await self._git("checkout", self.branch)
-                    else:
-                        await self._git("checkout", "-B", self.branch)
-
-                if await self._remote_branch_exists(self.branch):
-                    code, stdout, stderr = await self._git(
-                        "pull", "--rebase", "--autostash", "origin", self.branch
-                    )
-                    if code != 0:
-                        self._last_sync_status = f"Pull failed: {stderr or stdout}"
-                        logger.error(self._last_sync_status)
-                        return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
-                else:
-                    logger.info("Remote branch origin/%s does not exist yet; sync will create it on push", self.branch)
-
-                await self._git("add", "-A", check=True)
-
-                code, stdout, _ = await self._git("status", "--porcelain")
-                if code != 0:
-                    self._last_sync_status = "Status check failed"
-                    logger.error(self._last_sync_status)
-                    return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
-
-                if stdout.strip():
-                    commit_msg = f"Auto-sync update {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                    code, stdout, stderr = await self._git("commit", "-m", commit_msg)
-                    if code != 0:
-                        self._last_sync_status = f"Commit failed: {stderr or stdout}"
-                        logger.error(self._last_sync_status)
-                        return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
-
-                code, stdout, stderr = await self._git("push", "-u", "origin", f"HEAD:{self.branch}")
-                if code != 0:
-                    self._last_sync_status = f"Push failed: {stderr or stdout}"
-                    logger.error(self._last_sync_status)
-                    return {"status": "error", "error": self._last_sync_status, "log": self._last_sync_log}
-
-                self._last_sync_status = "Success" if stdout.strip() else "Success (No changes)"
-                self._last_sync_time = time.time()
-                logger.info("GitHub sync completed successfully on branch %s: %s", self.branch, self._last_sync_status)
-                return {"status": "success", "message": "Synced successfully", "branch": self.branch, "log": self._last_sync_log}
-
+                return await self.sync_locked()
             except Exception as e:
                 error = self._sanitize(str(e))
                 self._last_sync_status = f"Error: {error}"
@@ -290,7 +380,7 @@ class GitSync:
         await self.init_repo()
         await self.sync()
         while self.enabled:
-            await asyncio.sleep(self.interval)
+            await asyncio.sleep(max(1, int(self.interval or 1)))
             await self.sync()
         logger.info("GitHub sync loop stopped")
 
@@ -315,8 +405,10 @@ class GitSync:
             "branch": self.branch,
             "interval": self.interval,
             "last_sync_time": self._last_sync_time,
+            "last_restore_time": self._last_restore_time,
             "last_sync_status": self._last_sync_status,
             "log": self._last_sync_log,
+            "cwd": self.cwd,
         }
 
 
