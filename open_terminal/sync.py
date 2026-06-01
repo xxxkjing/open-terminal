@@ -65,7 +65,7 @@ class GitSync:
         self.cwd = os.path.abspath(os.path.expanduser(GITHUB_SYNC_CWD))
         self.branch = os.environ.get("OPEN_TERMINAL_GITHUB_BRANCH", "main")
         self.remote_name = "origin"
-        self.backup_dir = os.environ.get("OPEN_TERMINAL_GITHUB_BACKUP_DIR", ".open-terminal-backups")
+        self.backup_dir = os.environ.get("OPEN_TERMINAL_GITHUB_BACKUP_DIR", "open-terminal-backups").strip("/")
         self.max_retries = int(os.environ.get("OPEN_TERMINAL_GITHUB_SYNC_RETRIES", "3"))
         self.retry_delay = int(os.environ.get("OPEN_TERMINAL_GITHUB_SYNC_RETRY_DELAY", "5"))
 
@@ -222,6 +222,11 @@ class GitSync:
         if local_branch_code == 0:
             await self._git("checkout", self.branch, check=True)
         elif await self._remote_branch_exists(self.branch):
+            # On first startup with a non-empty remote data repo, /home/user may
+            # already contain image-seeded dotfiles such as .bashrc/.profile.
+            # Save those local files before checking out origin/main so Git does
+            # not abort with "untracked working tree files would be overwritten".
+            await self._create_startup_backup()
             await self._git("checkout", "-B", self.branch, f"{self.remote_name}/{self.branch}", check=True)
         else:
             await self._git("checkout", "-B", self.branch, check=True)
@@ -246,7 +251,8 @@ class GitSync:
             return None
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        branch = f"{self.backup_dir}/startup-{timestamp}"
+        branch_prefix = (self.backup_dir or "open-terminal-backups").strip("/.") or "open-terminal-backups"
+        branch = f"{branch_prefix}/startup-{timestamp}"
         if await self._has_commits():
             code, _, _ = await self._git("stash", "push", "--include-untracked", "-m", f"open-terminal startup backup {timestamp}")
             if code == 0:
@@ -256,9 +262,12 @@ class GitSync:
         await self._git("add", "-A", check=True)
         code, stdout, stderr = await self._git("commit", "-m", f"Startup backup before restore {timestamp}")
         if code == 0:
-            await self._git("branch", branch)
-            logger.info("Created startup backup commit and branch: %s", branch)
-            return branch
+            code, stdout, stderr = await self._git("branch", branch)
+            if code == 0:
+                logger.info("Created startup backup commit and branch: %s", branch)
+                return branch
+            logger.warning("Startup backup branch creation failed: %s", stderr or stdout)
+            return None
 
         logger.warning("Startup backup commit failed; continuing carefully: %s", stderr or stdout)
         return None
