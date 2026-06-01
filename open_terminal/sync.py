@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 from typing import Optional, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -25,17 +26,29 @@ def setup_sync_logging() -> str:
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, "sync.log")
 
-    for handler in logger.handlers:
-        if isinstance(handler, logging.FileHandler) and handler.baseFilename == log_path:
-            return log_path
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    has_file_handler = any(
+        isinstance(handler, logging.FileHandler) and handler.baseFilename == log_path
+        for handler in logger.handlers
     )
-    logger.addHandler(handler)
+    if not has_file_handler:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    has_console_handler = any(
+        getattr(handler, "_open_terminal_sync_console", False)
+        for handler in logger.handlers
+    )
+    if not has_console_handler:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        console_handler._open_terminal_sync_console = True
+        logger.addHandler(console_handler)
+
     logger.setLevel(logging.INFO)
-    logger.propagate = True
+    logger.propagate = False
     return log_path
 
 
